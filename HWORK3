@@ -1,0 +1,167 @@
+
+
+suppressPackageStartupMessages({
+  if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl")
+  if (!requireNamespace("arules", quietly = TRUE)) install.packages("arules")
+  if (!requireNamespace("reticulate", quietly = TRUE)) install.packages("reticulate")
+  if (!requireNamespace("glue", quietly = TRUE)) install.packages("glue")
+  library(readxl)
+  library(arules)
+  library(reticulate)
+  library(glue)
+})
+
+# -------- 1) Ruta al Excel (Paula) --------
+ruta <- "C:\\Users\\Paula\\Downloads\\base-de-datos-violencia-intrafamiliar-ano-2024_v3.xlsx"
+stopifnot(file.exists(ruta))
+
+# -------- 2) Lee Excel --------
+data <- readxl::read_excel(ruta)
+
+# -------- 3) Columnas (sin TRABAJA/DEDICA) --------
+cols_v <- c("HEC_MES","HEC_DEPTO","VIC_EDAD","VIC_ESCOLARIDAD","VIC_EST_CIV","VIC_GRUPET")
+cols_a <- c("HEC_MES","HEC_DEPTO","AGR_EDAD","AGR_ESCOLARIDAD","AGR_EST_CIV")
+
+dv <- data[, intersect(cols_v, names(data)), drop = FALSE]
+da <- data[, intersect(cols_a, names(data)), drop = FALSE]
+
+# -------- 4) HEC_TRIM desde HEC_MES --------
+mk_trim <- function(x) {
+  m <- suppressWarnings(as.numeric(x))
+  cut(m, breaks = c(0,3,6,9,12), labels = c("T1","T2","T3","T4"),
+      include.lowest = TRUE, right = TRUE)
+}
+if ("HEC_MES" %in% names(dv)) dv$HEC_TRIM <- mk_trim(dv$HEC_MES)
+if ("HEC_MES" %in% names(da)) da$HEC_TRIM <- mk_trim(da$HEC_MES)
+
+# -------- 5) Discretización por cuantiles (q=4) + NA explícito --------
+prep_df <- function(df) {
+  df <- as.data.frame(df)
+  for (cn in names(df)) {
+    if (is.numeric(df[[cn]])) {
+      # qcut con fallback a cortes iguales
+      q <- try(suppressWarnings(arules::discretize(df[[cn]], method = "frequency",
+                                                   categories = 4, ordered_result = TRUE)),
+               silent = TRUE)
+      # Para que sea de "cuantiles" reales usamos quantiles con cut si hay valores repetidos
+      if (inherits(q, "try-error") || is.null(q)) {
+        # Fallback: 4 bins iguales
+        df[[cn]] <- cut(df[[cn]], breaks = 4, include.lowest = TRUE, ordered_result = TRUE)
+      } else {
+        # El método "frequency" de arules reparte por frecuencia; simulamos qcut práctico
+        df[[cn]] <- q
+      }
+    }
+    if (!is.factor(df[[cn]])) df[[cn]] <- factor(df[[cn]])
+    df[[cn]] <- addNA(df[[cn]])               # añade nivel <NA>
+  }
+  if ("HEC_MES" %in% names(df)) df$HEC_MES <- NULL  # nos quedamos con HEC_TRIM
+  df
+}
+dv <- prep_df(dv)
+da <- prep_df(da)
+
+# -------- 6) One-hot robusto (misma nfilas, NA->0) --------
+make_onehot <- function(df) {
+  n <- nrow(df)
+  out <- NULL
+  for (cn in names(df)) {
+    levs <- levels(df[[cn]])
+    for (lv in levs) {
+      col <- as.integer(df[[cn]] == lv)
+      col[is.na(col)] <- 0L
+      cname <- paste0(cn, "=", lv)
+      if (is.null(out)) {
+        out <- matrix(col, nrow = n, dimnames = list(NULL, cname))
+      } else {
+        out <- cbind(out, col)
+        colnames(out)[ncol(out)] <- cname
+      }
+    }
+  }
+  onehot <- as.data.frame(out, check.names = FALSE)
+  # Convertir a lógico para mlxtend
+  onehot[] <- lapply(onehot, function(x) as.logical(as.integer(x)))
+  onehot
+}
+Xv <- make_onehot(dv)
+Xa <- make_onehot(da)
+
+# -------- 7) FP-Growth con Python (mlxtend) --------
+ensure_py <- function() {
+  if (!py_module_available("pandas") || !py_module_available("mlxtend")) {
+    message("Instalando dependencias de Python (pandas, mlxtend)...")
+    reticulate::py_install(c("pandas","mlxtend"), pip = TRUE)
+  }
+  list(
+    pd = import("pandas", convert = TRUE),
+    mp = import("mlxtend.frequent_patterns", convert = TRUE)
+  )
+}
+
+min_support <- 0.12   # distinto a 0.20
+min_conf    <- 0.60   # distinto a 0.50
+
+mine_rules <- function(onehot, etiqueta = "Nacional") {
+  if (!nrow(onehot)) return(invisible(NULL))
+  py <- ensure_py()
+  pdf <- py$pd$DataFrame(onehot)
+
+  fi <- py$mp$fpgrowth(pdf, min_support = min_support, use_colnames = TRUE)
+  if (isTRUE(fi$empty)) {
+    cat(glue("\n[{etiqueta}] Sin itemsets (support={min_support}). Baja el soporte.\n"))
+    return(invisible(NULL))
+  }
+  rules <- py$mp$association_rules(fi, metric = "confidence", min_threshold = min_conf)
+  # Convertir a data.frame R
+  to_text <- function(py_set) paste(sort(as.character(unlist(py_to_r(py_set)))), collapse = " ∧ ")
+  rf <- data.frame(
+    rules      = paste(sapply(rules$antecedents, to_text), "=>", sapply(rules$consequents, to_text)),
+    support    = as.numeric(rules$support),
+    confidence = as.numeric(rules$confidence),
+    lift       = as.numeric(rules$lift),
+    leverage   = as.numeric(rules$leverage),
+    conviction = as.numeric(rules$conviction),
+    stringsAsFactors = FALSE
+  )
+  if (!nrow(rf)) {
+    cat(glue("\n[{etiqueta}] Sin reglas (conf={min_conf}). Baja la confianza.\n"))
+    return(invisible(NULL))
+  }
+  rf <- rf[order(-rf$conviction, -rf$leverage, -rf$confidence, -rf$support), ]
+  cat(glue("\n=== TOP-10 {etiqueta} (conviction > leverage > confidence > support) ===\n"))
+  print(utils::head(rf[, c("rules","support","confidence","leverage","conviction")], 10), row.names = FALSE)
+  rf
+}
+
+rf_v <- mine_rules(Xv, "Víctima — Nacional")
+rf_a <- mine_rules(Xa, "Agresor — Nacional")
+
+# -------- 8) Elegir 3 patrones NUEVOS (sin TRABAJA/DEDICA) --------
+pick_three <- function(df_rules) {
+  if (is.null(df_rules) || !nrow(df_rules)) return(data.frame())
+  mask <- !grepl("trabaja|dedica", tolower(df_rules$rules))
+  out <- df_rules[mask, c("rules","support","confidence","leverage","conviction"), drop = FALSE]
+  out <- out[order(-out$conviction, -out$leverage, -out$confidence, -out$support), ]
+  utils::head(out, 3)
+}
+
+top3_v <- pick_three(rf_v)
+top3_a <- pick_three(rf_a)
+top3 <- top3_v
+if (is.null(top3) || nrow(top3) < 3) {
+  faltan <- 3 - nrow(top3)
+  top3 <- rbind(top3, utils::head(top3_a, faltan))
+}
+
+cat("\n=== TUS 3 PATRONES NUEVOS (sin TRABAJA/DEDICA) ===\n")
+if (!is.null(top3) && nrow(top3)) print(top3, row.names = FALSE) else cat("No se encontraron con los umbrales actuales.\n")
+
+# -------- 9) Guardar CSV --------
+if (!dir.exists("out_R")) dir.create("out_R")
+if (!is.null(rf_v) && nrow(rf_v)) utils::write.csv(rf_v, "out_R/reglas_victima_R.csv", row.names = FALSE)
+if (!is.null(rf_a) && nrow(rf_a)) utils::write.csv(rf_a, "out_R/reglas_agresor_R.csv", row.names = FALSE)
+if (!is.null(top3) && nrow(top3)) utils::write.csv(top3, "out_R/top3_R.csv", row.names = FALSE)
+
+cat("\nListo. Revisa la carpeta 'out_R/' (reglas_victima_R.csv, reglas_agresor_R.csv, top3_R.csv)\n")
+cat("Si salen pocas reglas, baja min_support a 0.10 o 0.08; si sobran, súbelo a 0.15.\n")
